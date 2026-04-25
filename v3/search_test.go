@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/jfjallid/testify/assert"
 )
 
 // TestNewEntry tests that repeated calls to NewEntry return the same value with the same input

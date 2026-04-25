@@ -13,14 +13,26 @@ type Attribute struct {
 	Type string
 	// Vals are the LDAP attribute values
 	Vals []string
+	// ByteVals are the raw binary LDAP attribute values.
+	// When set, ByteVals takes precedence over Vals during encoding.
+	ByteVals [][]byte
 }
 
 func (a *Attribute) encode() *ber.Packet {
 	seq := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "Attribute")
 	seq.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, a.Type, "Type"))
 	set := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSet, nil, "AttributeValue")
-	for _, value := range a.Vals {
-		set.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, value, "Vals"))
+	if len(a.ByteVals) > 0 {
+		for _, value := range a.ByteVals {
+			pkt := ber.Encode(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, nil, "Vals")
+			pkt.Value = value
+			pkt.Data.Write(value)
+			set.AppendChild(pkt)
+		}
+	} else {
+		for _, value := range a.Vals {
+			set.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, value, "Vals"))
+		}
 	}
 	seq.AppendChild(set)
 	return seq
@@ -56,6 +68,11 @@ func (req *AddRequest) appendTo(envelope *ber.Packet) error {
 // Attribute adds an attribute with the given type and values
 func (req *AddRequest) Attribute(attrType string, attrVals []string) {
 	req.Attributes = append(req.Attributes, Attribute{Type: attrType, Vals: attrVals})
+}
+
+// AttributeBytes adds an attribute with the given type and raw binary values
+func (req *AddRequest) AttributeBytes(attrType string, attrVals [][]byte) {
+	req.Attributes = append(req.Attributes, Attribute{Type: attrType, ByteVals: attrVals})
 }
 
 // NewAddRequest returns an AddRequest for the given DN, with no attributes

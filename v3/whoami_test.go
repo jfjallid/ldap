@@ -3,7 +3,7 @@ package ldap
 import (
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/jfjallid/testify/assert"
 )
 
 func TestConn_WhoAmI(t *testing.T) {

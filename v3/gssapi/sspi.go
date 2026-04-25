@@ -5,7 +5,6 @@ package gssapi
 
 import (
 	"bytes"
-	"crypto"
 	"crypto/x509"
 	"encoding/binary"
 	"fmt"
@@ -246,43 +245,4 @@ func createChannelBindingsStructure(applicationData []byte) []byte {
 	copy(buf[headerSize:], applicationData)
 
 	return buf
-}
-
-// calculateCertificateHash implements RFC 5929 certificate hash calculation.
-// https://www.rfc-editor.org/rfc/rfc5929.html#section-4.1
-func calculateCertificateHash(cert *x509.Certificate) []byte {
-	var hashFunc crypto.Hash
-
-	switch cert.SignatureAlgorithm {
-	case x509.SHA256WithRSA,
-		x509.SHA256WithRSAPSS,
-		x509.ECDSAWithSHA256,
-		x509.DSAWithSHA256:
-
-		hashFunc = crypto.SHA256
-	case x509.SHA384WithRSA,
-		x509.SHA384WithRSAPSS,
-		x509.ECDSAWithSHA384:
-
-		hashFunc = crypto.SHA384
-	case x509.SHA512WithRSA,
-		x509.SHA512WithRSAPSS,
-		x509.ECDSAWithSHA512:
-
-		hashFunc = crypto.SHA512
-	case x509.MD5WithRSA,
-		x509.SHA1WithRSA,
-		x509.ECDSAWithSHA1,
-		x509.DSAWithSHA1:
-
-		hashFunc = crypto.SHA256
-	default:
-		return nil
-	}
-
-	hasher := hashFunc.New()
-
-	// Important to hash cert in DER format.
-	hasher.Write(cert.Raw)
-	return hasher.Sum(nil)
 }

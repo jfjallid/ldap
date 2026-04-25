@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/jfjallid/testify/assert"
 )
 
 func TestSuccessfulDNParsing(t *testing.T) {

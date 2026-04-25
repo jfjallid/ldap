@@ -3,18 +3,20 @@ package ldap
 import (
 	"bytes"
 	"crypto/md5"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
 	enchex "encoding/hex"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"strings"
 	"unicode/utf16"
 
-	"github.com/Azure/go-ntlmssp"
 	ber "github.com/go-asn1-ber/asn1-ber"
+	"github.com/jfjallid/go-smb/ntlmssp"
+	"github.com/jfjallid/ldap/v3/gssapi"
 	"golang.org/x/crypto/md4" //nolint:staticcheck
 )
 
@@ -212,7 +214,7 @@ func (l *Conn) DigestMD5Bind(digestMD5BindRequest *DigestMD5BindRequest) (*Diges
 			if child.Data == nil {
 				return result, GetLDAPError(packet)
 			}
-			data, _ := ioutil.ReadAll(child.Data)
+			data, _ := io.ReadAll(child.Data)
 			params, err = parseParams(string(data))
 			if err != nil {
 				return result, fmt.Errorf("parsing digest-challenge: %s", err)
@@ -421,9 +423,7 @@ func (l *Conn) ExternalBind() error {
 	return GetLDAPError(packet)
 }
 
-// NTLMBind performs an NTLMSSP bind leveraging https://github.com/Azure/go-ntlmssp
-
-// NTLMBindRequest represents an NTLMSSP bind operation
+// NTLMBindRequest represents an NTLMSSP bind operation.
 type NTLMBindRequest struct {
 	// Domain is the AD Domain to authenticate too. If not specified, it will be grabbed from the NTLMSSP Challenge
 	Domain string
@@ -436,10 +436,21 @@ type NTLMBindRequest struct {
 	AllowEmptyPassword bool
 	// Hash is the hex NTLM hash to bind with. Password or hash must be provided
 	Hash string
+	// ChannelBinding enables EPA (Extended Protection for Authentication)
+	// channel binding. When true and the connection uses TLS, the NTLM
+	// authenticate message will include the TLS channel binding hash
+	// derived from the server's certificate (RFC 5929).
+	ChannelBinding bool
 	// Controls are optional controls to send with the bind request
 	Controls []Control
 	// Negotiator allows to specify a custom NTLM negotiator.
+	// When set, SASLSecurity is ignored (no SASL wrapping with custom negotiators).
 	Negotiator NTLMNegotiator
+	// SASLSecurity controls SASL signing/sealing on the connection after a
+	// successful NTLM bind. Default (zero value) is SASLSecurityNone.
+	SASLSecurity SASLSecurityMode
+	// ntlmClient holds the stateful NTLM client between negotiate and authenticate phases
+	ntlmClient *ntlmssp.Client
 }
 
 // NTLMNegotiator is an abstraction of an NTLM implementation that produces and
@@ -456,10 +467,27 @@ func (req *NTLMBindRequest) appendTo(envelope *ber.Packet) (err error) {
 
 	var negMessage []byte
 
-	// generate an NTLMSSP Negotiation message for the  specified domain (it can be blank)
+	// generate an NTLMSSP Negotiation message for the specified domain (it can be blank)
 	switch {
 	case req.Negotiator == nil:
-		negMessage, err = ntlmssp.NewNegotiateMessage(req.Domain, "")
+		req.ntlmClient = &ntlmssp.Client{
+			Domain:      req.Domain,
+			Workstation: "",
+		}
+		// Configure the NTLM client flags to match the requested SASL
+		// security level. StripFlags and DisableMIC are applied inside
+		// go-smb before any internal state is stored, so the flag
+		// intersection, MIC, and session keys all remain consistent.
+		//
+		// Note: AD always seals LDAP SASL responses when NTLM integrity
+		// is negotiated, so SASLSecuritySign uses the same NTLM flags as
+		// SASLSecuritySeal. The SASL layer handles both modes via
+		// Seal/Unseal.
+		if req.SASLSecurity == SASLSecurityNone {
+			req.ntlmClient.StripFlags = ntlmssp.FlgNegSign | ntlmssp.FlgNegSeal
+			req.ntlmClient.DisableMIC = true
+		}
+		negMessage, err = req.ntlmClient.Negotiate()
 		if err != nil {
 			return fmt.Errorf("create NTLM negotiate message: %s", err)
 		}
@@ -496,9 +524,9 @@ func (l *Conn) NTLMBind(domain, username, password string) error {
 	return err
 }
 
-// NTLMUnauthenticatedBind performs an bind with an empty password.
+// NTLMUnauthenticatedBind performs a bind with an empty password.
 //
-// A username is required. The anonymous bind is not (yet) supported by the go-ntlmssp library (https://github.com/Azure/go-ntlmssp/blob/819c794454d067543bc61d29f61fef4b3c3df62c/authenticate_message.go#L87)
+// A username is required.
 //
 // See https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-nlmp/b38c36ed-2804-4868-a9ff-8dd3182128e4 part 3.2.5.1.2
 func (l *Conn) NTLMUnauthenticatedBind(domain, username string) error {
@@ -529,28 +557,45 @@ func (l *Conn) NTLMChallengeBind(ntlmBindRequest *NTLMBindRequest) (*NTLMBindRes
 		return nil, NewError(ErrorEmptyPassword, errors.New("ldap: empty password not allowed by the client"))
 	}
 
+	// Determine whether we need SASL wrapping. SASL sign/seal is
+	// incompatible with TLS (AD rejects it) and only works with the
+	// go-smb ntlmssp client (not custom Negotiators).
+	saslMode := ntlmBindRequest.SASLSecurity
+	if l.isTLS || ntlmBindRequest.Negotiator != nil {
+		saslMode = SASLSecurityNone
+	}
+	useSASL := saslMode != SASLSecurityNone
+
+	// --- Phase 1: send NTLM Negotiate, receive Challenge ---
 	msgCtx, err := l.doRequest(ntlmBindRequest)
 	if err != nil {
 		return nil, err
 	}
-	defer l.finishMessage(msgCtx)
 	packet, err := l.readPacket(msgCtx)
 	if err != nil {
+		l.finishMessage(msgCtx)
 		return nil, err
 	}
 	l.Debug.Printf("%d: got response %p", msgCtx.id, packet)
 	if l.Debug {
 		if err = addLDAPDescriptions(packet); err != nil {
+			l.finishMessage(msgCtx)
 			return nil, err
 		}
 		ber.PrintPacket(packet)
 	}
+
+	// Finish the first message explicitly so there are zero outstanding
+	// requests when we send the second. This is required when using
+	// sendMessageWithFlags(startTLS) for SASL reader restart.
+	l.finishMessage(msgCtx)
+
 	result := &NTLMBindResult{
 		Controls: make([]Control, 0),
 	}
 	var ntlmsspChallenge []byte
 
-	// now find the NTLM Response Message
+	// Extract the NTLM Challenge from the server response
 	if len(packet.Children) == 2 {
 		if len(packet.Children[1].Children) == 3 {
 			child := packet.Children[1].Children[1]
@@ -562,63 +607,134 @@ func (l *Conn) NTLMChallengeBind(ntlmBindRequest *NTLMBindRequest) (*NTLMBindRes
 			l.Debug.Printf("%d: found ntlmssp challenge", msgCtx.id)
 		}
 	}
-	if ntlmsspChallenge != nil {
-		var err error
-		var responseMessage []byte
-
-		switch {
-		case ntlmBindRequest.Hash == "" && ntlmBindRequest.Password == "" && !ntlmBindRequest.AllowEmptyPassword:
-			err = fmt.Errorf("need a password or hash to generate reply")
-		case ntlmBindRequest.Negotiator == nil && ntlmBindRequest.Hash != "":
-			responseMessage, err = ntlmssp.ProcessChallengeWithHash(ntlmsspChallenge, ntlmBindRequest.Username, ntlmBindRequest.Hash)
-		case ntlmBindRequest.Negotiator == nil && (ntlmBindRequest.Password != "" || ntlmBindRequest.AllowEmptyPassword):
-			// generate a response message to the challenge with the given Username/Password if password is provided
-			_, _, domainNeeded := ntlmssp.GetDomain(ntlmBindRequest.Username)
-			responseMessage, err = ntlmssp.ProcessChallenge(ntlmsspChallenge, ntlmBindRequest.Username, ntlmBindRequest.Password, domainNeeded)
-		default:
-			hash := ntlmBindRequest.Hash
-			if len(hash) == 0 {
-				hash = ntHash(ntlmBindRequest.Password)
-			}
-
-			responseMessage, err = ntlmBindRequest.Negotiator.ChallengeResponse(ntlmsspChallenge, ntlmBindRequest.Username, hash)
-		}
-
-		if err != nil {
-			return result, fmt.Errorf("process NTLM challenge: %s", err)
-		}
-
-		packet = ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Request")
-		packet.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, l.nextMessageID(), "MessageID"))
-
-		request := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ApplicationBindRequest, nil, "Bind Request")
-		request.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, 3, "Version"))
-		request.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "User Name"))
-
-		// append the challenge response message as a TagEmbeddedPDV BER value
-		auth := ber.Encode(ber.ClassContext, ber.TypePrimitive, ber.TagEmbeddedPDV, responseMessage, "authentication")
-
-		request.AppendChild(auth)
-		packet.AppendChild(request)
-		msgCtx, err = l.sendMessage(packet)
-		if err != nil {
-			return nil, fmt.Errorf("send message: %s", err)
-		}
-		defer l.finishMessage(msgCtx)
-		packetResponse, ok := <-msgCtx.responses
-		if !ok {
-			return nil, NewError(ErrorNetwork, errors.New("ldap: response channel closed"))
-		}
-		packet, err = packetResponse.ReadPacket()
-		l.Debug.Printf("%d: got response %p", msgCtx.id, packet)
-		if err != nil {
-			return nil, fmt.Errorf("read packet: %s", err)
-		}
-
+	if ntlmsspChallenge == nil {
+		return result, GetLDAPError(packet)
 	}
 
-	err = GetLDAPError(packet)
-	return result, err
+	// --- Phase 2: generate NTLM Authenticate response ---
+	var responseMessage []byte
+
+	switch {
+	case ntlmBindRequest.Hash == "" && ntlmBindRequest.Password == "" && !ntlmBindRequest.AllowEmptyPassword:
+		err = fmt.Errorf("need a password or hash to generate reply")
+	case ntlmBindRequest.Negotiator == nil:
+		// Extract domain from username if present (DOMAIN\user format)
+		username := ntlmBindRequest.Username
+		domain := ntlmBindRequest.Domain
+		if parts := strings.SplitN(username, `\`, 2); len(parts) == 2 {
+			domain = parts[0]
+			username = parts[1]
+		}
+		ntlmBindRequest.ntlmClient.User = username
+		ntlmBindRequest.ntlmClient.Domain = domain
+		if ntlmBindRequest.Hash != "" {
+			hashBytes, decErr := hex.DecodeString(ntlmBindRequest.Hash)
+			if decErr != nil {
+				return result, fmt.Errorf("failed to decode NTLM hash: %s", decErr)
+			}
+			ntlmBindRequest.ntlmClient.Hash = hashBytes
+		} else {
+			ntlmBindRequest.ntlmClient.Password = ntlmBindRequest.Password
+		}
+		if ntlmBindRequest.ChannelBinding {
+			cbHash, cbErr := l.computeNTLMChannelBinding()
+			if cbErr != nil {
+				return result, cbErr
+			}
+			ntlmBindRequest.ntlmClient.SetChannelBindingHash(cbHash)
+		}
+		responseMessage, err = ntlmBindRequest.ntlmClient.Authenticate(ntlmsspChallenge)
+	default:
+		hash := ntlmBindRequest.Hash
+		if len(hash) == 0 {
+			hash = ntHash(ntlmBindRequest.Password)
+		}
+		responseMessage, err = ntlmBindRequest.Negotiator.ChallengeResponse(ntlmsspChallenge, ntlmBindRequest.Username, hash)
+	}
+
+	if err != nil {
+		return result, fmt.Errorf("process NTLM challenge: %s", err)
+	}
+
+	// --- Phase 3: send Authenticate, receive bind result ---
+	packet = ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Request")
+	packet.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, l.nextMessageID(), "MessageID"))
+
+	request := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ApplicationBindRequest, nil, "Bind Request")
+	request.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, 3, "Version"))
+	request.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "User Name"))
+
+	// append the challenge response message as a TagEmbeddedPDV BER value
+	auth := ber.Encode(ber.ClassContext, ber.TypePrimitive, ber.TagEmbeddedPDV, responseMessage, "authentication")
+
+	request.AppendChild(auth)
+	packet.AppendChild(request)
+
+	// When SASL wrapping will be installed, use the startTLS flag to
+	// cleanly stop the reader goroutine after delivering the response.
+	var flags sendMessageFlags
+	if useSASL {
+		flags = startTLS
+	}
+	msgCtx, err = l.sendMessageWithFlags(packet, flags)
+	if err != nil {
+		return nil, fmt.Errorf("send message: %s", err)
+	}
+	defer l.finishMessage(msgCtx)
+
+	packetResponse, ok := <-msgCtx.responses
+	if !ok {
+		return nil, NewError(ErrorNetwork, errors.New("ldap: response channel closed"))
+	}
+	packet, err = packetResponse.ReadPacket()
+	l.Debug.Printf("%d: got response %p", msgCtx.id, packet)
+	if err != nil {
+		return nil, fmt.Errorf("read packet: %s", err)
+	}
+
+	if err = GetLDAPError(packet); err != nil {
+		return result, err
+	}
+
+	// --- Phase 4: install SASL wrapping if requested ---
+	if useSASL {
+		session := ntlmBindRequest.ntlmClient.Session()
+		if session == nil {
+			return result, fmt.Errorf("ldap: NTLM session not available for SASL wrapping")
+		}
+		l.conn = newSASLConn(l.conn, session)
+		go l.reader()
+	}
+
+	return result, nil
+}
+
+// tlsServerCertificate returns the peer's TLS leaf certificate for use in
+// RFC 5929 channel binding. It errors if the connection is not TLS or the
+// peer sent no certificate.
+func (l *Conn) tlsServerCertificate() (*x509.Certificate, error) {
+	tlsState, ok := l.TLSConnectionState()
+	if !ok {
+		return nil, fmt.Errorf("ldap: channel binding requested but connection is not TLS")
+	}
+	if len(tlsState.PeerCertificates) == 0 {
+		return nil, fmt.Errorf("ldap: channel binding requested but server sent no certificate")
+	}
+	return tlsState.PeerCertificates[0], nil
+}
+
+// computeNTLMChannelBinding returns the 16-byte channel-binding hash that
+// NTLM places in MsvAvChannelBindings.
+func (l *Conn) computeNTLMChannelBinding() ([16]byte, error) {
+	cert, err := l.tlsServerCertificate()
+	if err != nil {
+		return [16]byte{}, err
+	}
+	certHash := gssapi.CertificateHash(cert)
+	if certHash == nil {
+		return [16]byte{}, fmt.Errorf("ldap: unsupported certificate signature algorithm for channel binding")
+	}
+	return gssapi.ComputeChannelBindingHash(certHash), nil
 }
 
 func ntHash(pass string) string {
@@ -679,6 +795,15 @@ type GSSAPIBindRequest struct {
 	AuthZID string
 	// (Optional) Controls to send with the bind request
 	Controls []Control
+	// SASLSecurity controls SASL signing/sealing on the connection after a
+	// successful GSSAPI bind. Default (zero value) is SASLSecurityNone.
+	SASLSecurity SASLSecurityMode
+	// ChannelBinding enables RFC 5929 "tls-server-end-point" channel
+	// binding. When true and the connection uses TLS, the TLS peer
+	// certificate is hashed and bound into the Kerberos authenticator
+	// checksum. The provided GSSAPIClient must implement
+	// SetChannelBinding(*x509.Certificate) error for this to take effect.
+	ChannelBinding bool
 }
 
 // GSSAPIBind performs the GSSAPI SASL bind using the provided GSSAPI client.
@@ -694,15 +819,54 @@ func (l *Conn) GSSAPIBindRequest(client GSSAPIClient, req *GSSAPIBindRequest) er
 	return l.GSSAPIBindRequestWithAPOptions(client, req, []int{})
 }
 
-// GSSAPIBindRequest performs the GSSAPI SASL bind using the provided GSSAPI client.
+// GSSAPIBindRequestWithAPOptions performs the GSSAPI SASL bind using the provided GSSAPI client.
 func (l *Conn) GSSAPIBindRequestWithAPOptions(client GSSAPIClient, req *GSSAPIBindRequest, APOptions []int) error {
 	//nolint:errcheck
 	defer client.DeleteSecContext()
+
+	// Determine whether we need SASL wrapping. SASL sign/seal is
+	// incompatible with TLS.
+	saslMode := req.SASLSecurity
+	if l.isTLS {
+		saslMode = SASLSecurityNone
+	}
+	useSASL := saslMode != SASLSecurityNone
+
+	// Plumb the requested SASL security layer into the client so that the
+	// security-layer byte sent during NegotiateSaslAuth matches the wrapping
+	// installed below. Type assertion keeps the GSSAPIClient interface
+	// stable for callers with custom implementations.
+	type saslSecuritySetter interface {
+		SetSASLSecurity(mode int)
+	}
+	if s, ok := client.(saslSecuritySetter); ok {
+		s.SetSASLSecurity(int(saslMode))
+	} else if useSASL {
+		return fmt.Errorf("ldap: GSSAPI client does not support SASL security layer negotiation")
+	}
+
+	if req.ChannelBinding {
+		type channelBindingSetter interface {
+			SetChannelBinding(cert *x509.Certificate) error
+		}
+		cs, ok := client.(channelBindingSetter)
+		if !ok {
+			return fmt.Errorf("ldap: GSSAPI client does not support channel binding")
+		}
+		cert, certErr := l.tlsServerCertificate()
+		if certErr != nil {
+			return certErr
+		}
+		if err := cs.SetChannelBinding(cert); err != nil {
+			return err
+		}
+	}
 
 	var err error
 	var reqToken []byte
 	var recvToken []byte
 	needInit := true
+	saslPhase := false // true once we enter NegotiateSaslAuth
 	for {
 		if needInit {
 			// Establish secure context between client and server.
@@ -712,14 +876,24 @@ func (l *Conn) GSSAPIBindRequestWithAPOptions(client GSSAPIClient, req *GSSAPIBi
 			}
 		} else {
 			// Secure context is set up, perform the last step of SASL handshake.
+			saslPhase = true
 			reqToken, err = client.NegotiateSaslAuth(recvToken, req.AuthZID)
 			if err != nil {
 				return err
 			}
 		}
+
+		// Only use startTLS on the NegotiateSaslAuth exchange (not the
+		// final InitSecContext exchange) so the reader goroutine stays
+		// alive for the AP-REP round trip.
+		var flags sendMessageFlags
+		if saslPhase && useSASL {
+			flags = startTLS
+		}
+
 		// Send Bind request containing the current token and extract the
 		// token sent by server.
-		recvToken, err = l.saslBindTokenExchange(req.Controls, reqToken)
+		recvToken, err = l.saslBindTokenExchangeWithFlags(req.Controls, reqToken, flags)
 		if err != nil {
 			return err
 		}
@@ -729,10 +903,27 @@ func (l *Conn) GSSAPIBindRequestWithAPOptions(client GSSAPIClient, req *GSSAPIBi
 		}
 	}
 
+	// Install Kerberos SASL wrapping if requested.
+	if useSASL {
+		// Use type assertion to get the session subkey from the GSSAPI client.
+		// The saslKeyProvider interface is intentionally local to avoid
+		// coupling the core ldap package to gokrb5 types.
+		type saslKeyProvider interface {
+			SASLKey() (keyType int32, keyValue []byte)
+		}
+		skp, ok := client.(saslKeyProvider)
+		if !ok {
+			return fmt.Errorf("ldap: GSSAPI client does not support SASL key export for wrapping")
+		}
+		keyType, keyValue := skp.SASLKey()
+		l.conn = newKrbSASLConn(l.conn, keyType, keyValue, saslMode)
+		go l.reader()
+	}
+
 	return nil
 }
 
-func (l *Conn) saslBindTokenExchange(reqControls []Control, reqToken []byte) ([]byte, error) {
+func (l *Conn) saslBindTokenExchangeWithFlags(reqControls []Control, reqToken []byte, flags sendMessageFlags) ([]byte, error) {
 	// Construct LDAP Bind request with GSSAPI SASL mechanism.
 	envelope := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Request")
 	envelope.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, l.nextMessageID(), "MessageID"))
@@ -752,7 +943,7 @@ func (l *Conn) saslBindTokenExchange(reqControls []Control, reqToken []byte) ([]
 		envelope.AppendChild(encodeControls(reqControls))
 	}
 
-	msgCtx, err := l.sendMessage(envelope)
+	msgCtx, err := l.sendMessageWithFlags(envelope, flags)
 	if err != nil {
 		return nil, err
 	}
@@ -800,15 +991,15 @@ RESP:
 				if referral.ClassType != ber.ClassContext || referral.Tag != ber.TagObjectDescriptor {
 					break RESP
 				}
-				return ioutil.ReadAll(referral.Data)
+				return io.ReadAll(referral.Data)
 			}
 			// Optional:
 			//if len(protocolOp.Children) == 4 {
 			//	serverSaslCreds := protocolOp.Children[4]
 			//}
 		case 0: // Success - Bind OK.
-			// SASL layer in effect (if any) (See https://www.rfc-editor.org/rfc/rfc4513#section-5.2.1.4)
-			// NOTE: SASL security layers are not supported currently.
+			// SASL layer installed by caller if negotiated.
+			// See https://www.rfc-editor.org/rfc/rfc4513#section-5.2.1.4
 			return nil, nil
 		}
 	}

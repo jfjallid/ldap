@@ -21,14 +21,26 @@ type PartialAttribute struct {
 	Type string
 	// Vals are the values of the partial attribute
 	Vals []string
+	// ByteVals are the raw binary values of the partial attribute.
+	// When set, ByteVals takes precedence over Vals during encoding.
+	ByteVals [][]byte
 }
 
 func (p *PartialAttribute) encode() *ber.Packet {
 	seq := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "PartialAttribute")
 	seq.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, p.Type, "Type"))
 	set := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSet, nil, "AttributeValue")
-	for _, value := range p.Vals {
-		set.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, value, "Vals"))
+	if len(p.ByteVals) > 0 {
+		for _, value := range p.ByteVals {
+			pkt := ber.Encode(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, nil, "Vals")
+			pkt.Value = value
+			pkt.Data.Write(value)
+			set.AppendChild(pkt)
+		}
+	} else {
+		for _, value := range p.Vals {
+			set.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, value, "Vals"))
+		}
 	}
 	seq.AppendChild(set)
 	return seq
@@ -81,6 +93,25 @@ func (req *ModifyRequest) Increment(attrType string, attrVal string) {
 
 func (req *ModifyRequest) appendChange(operation uint, attrType string, attrVals []string) {
 	req.Changes = append(req.Changes, Change{operation, PartialAttribute{Type: attrType, Vals: attrVals}})
+}
+
+// AddBytes appends the given attribute with raw binary values to the list of changes to be made
+func (req *ModifyRequest) AddBytes(attrType string, attrVals [][]byte) {
+	req.appendByteChange(AddAttribute, attrType, attrVals)
+}
+
+// DeleteBytes appends the given attribute with raw binary values to the list of changes to be made
+func (req *ModifyRequest) DeleteBytes(attrType string, attrVals [][]byte) {
+	req.appendByteChange(DeleteAttribute, attrType, attrVals)
+}
+
+// ReplaceBytes appends the given attribute with raw binary values to the list of changes to be made
+func (req *ModifyRequest) ReplaceBytes(attrType string, attrVals [][]byte) {
+	req.appendByteChange(ReplaceAttribute, attrType, attrVals)
+}
+
+func (req *ModifyRequest) appendByteChange(operation uint, attrType string, attrVals [][]byte) {
+	req.Changes = append(req.Changes, Change{operation, PartialAttribute{Type: attrType, ByteVals: attrVals}})
 }
 
 func (req *ModifyRequest) appendTo(envelope *ber.Packet) error {

@@ -1,13 +1,17 @@
-[![GoDoc](https://godoc.org/github.com/go-ldap/ldap?status.svg)](https://godoc.org/github.com/go-ldap/ldap)
+[![GoDoc](https://pkg.go.dev/badge/github.com/jfjallid/ldap/v3.svg)](https://pkg.go.dev/github.com/jfjallid/ldap/v3)
 
 # Basic LDAP v3 functionality for the GO programming language.
+
+Forked from [github.com/go-ldap/ldap](https://github.com/go-ldap/ldap).
 
 The library implements the following specifications:
 
 - https://datatracker.ietf.org/doc/html/rfc4511 for basic operations
 - https://datatracker.ietf.org/doc/html/rfc3062 for password modify operation
 - https://datatracker.ietf.org/doc/html/rfc4514 for distinguished names parsing
+- https://datatracker.ietf.org/doc/html/rfc4517 for postal address parsing
 - https://datatracker.ietf.org/doc/html/rfc4533 for Content Synchronization Operation
+- https://datatracker.ietf.org/doc/html/rfc5929 for TLS channel binding (`tls-server-end-point`)
 - https://datatracker.ietf.org/doc/html/draft-armijo-ldap-treedelete-02 for Tree Delete Control
 - https://datatracker.ietf.org/doc/html/rfc2891 for Server Side Sorting of Search Results
 - https://datatracker.ietf.org/doc/html/rfc4532 for WhoAmI requests
@@ -16,6 +20,10 @@ The library implements the following specifications:
 
 - Connecting to LDAP server (non-TLS, TLS, STARTTLS, through a custom dialer)
 - Bind Requests / Responses (Simple Bind, GSSAPI, SASL)
+- NTLM bind with TLS channel binding (Extended Protection for Authentication, RFC 5929)
+- Kerberos / GSSAPI bind with TLS channel binding
+- SASL sign/seal security layer for NTLM and Kerberos binds
+- Raw binary attribute values via `AttributeBytes` / `AddBytes` / `DeleteBytes` / `ReplaceBytes`
 - "Who Am I" Requests / Responses
 - Search Requests / Responses (normal, paging and asynchronous)
 - Modify Requests / Responses
@@ -32,7 +40,7 @@ The library implements the following specifications:
 
 ## Go Modules:
 
-`go get github.com/go-ldap/ldap/v3`
+`go get github.com/jfjallid/ldap/v3`
 
 ## Contributing:
 
