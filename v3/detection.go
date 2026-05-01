@@ -102,13 +102,3 @@ func interpretSigningProbe(l *Conn, bindErr error) (bool, error) {
 	}
 	return false, bindErr
 }
-
-// IsSigningRequired reports whether err is an LDAP strongerAuthRequired
-// (code 8) response from a bind that did not negotiate signing. On a
-// non-TLS connection this is the canonical signal that the server enforces
-// the LDAP integrity policy. Over TLS the same code 8 instead indicates
-// the channel-binding policy, so callers must verify the connection is
-// non-TLS before drawing the "signing required" conclusion from this.
-func IsSigningRequired(err error) bool {
-	return IsErrorWithCode(err, LDAPResultStrongAuthRequired)
-}
