@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/md5"
 	"crypto/x509"
-	"encoding/binary"
 	"encoding/hex"
 	enchex "encoding/hex"
 	"errors"
@@ -12,12 +11,9 @@ import (
 	"io"
 	"math/rand"
 	"strings"
-	"unicode/utf16"
 
 	ber "github.com/go-asn1-ber/asn1-ber"
-	"github.com/jfjallid/go-smb/ntlmssp"
 	"github.com/jfjallid/ldap/v3/gssapi"
-	"golang.org/x/crypto/md4" //nolint:staticcheck
 )
 
 // SimpleBindRequest represents a username/password bind operation
@@ -443,59 +439,87 @@ type NTLMBindRequest struct {
 	ChannelBinding bool
 	// Controls are optional controls to send with the bind request
 	Controls []Control
-	// Negotiator allows to specify a custom NTLM negotiator.
-	// When set, SASLSecurity is ignored (no SASL wrapping with custom negotiators).
+	// Negotiator supplies the NTLM implementation explicitly. When nil, the
+	// request is served by the package-level NTLMNegotiatorFactory
+	// using the credential fields above. If neither
+	// is available the bind fails.
 	Negotiator NTLMNegotiator
 	// SASLSecurity controls SASL signing/sealing on the connection after a
-	// successful NTLM bind. Default (zero value) is SASLSecurityNone.
+	// successful NTLM bind. Default (zero value) is SASLSecurityNone. It takes
+	// effect only when the resolved negotiator implements NTLMSessionProvider
+	// and the connection is not already protected by TLS.
 	SASLSecurity SASLSecurityMode
-	// ntlmClient holds the stateful NTLM client between negotiate and authenticate phases
-	ntlmClient *ntlmssp.Client
+	// neg is the resolved negotiator, retained between the negotiate and
+	// authenticate phases of a single bind.
+	neg NTLMNegotiator
 }
 
 // NTLMNegotiator is an abstraction of an NTLM implementation that produces and
-// processes NTLM binary tokens.
+// consumes NTLM binary tokens. Credentials are configured on the concrete
+// implementation; ldap only drives the token exchange. This keeps the ldap
+// module free of any concrete NTLM dependency.
 type NTLMNegotiator interface {
-	Negotiate(domain string, workstation string) ([]byte, error)
-	ChallengeResponse(challenge []byte, username string, hash string) ([]byte, error)
+	// Negotiate returns the NTLM NEGOTIATE_MESSAGE for the given domain and
+	// workstation (either may be empty).
+	Negotiate(domain, workstation string) ([]byte, error)
+	// ChallengeResponse consumes the server CHALLENGE_MESSAGE and returns the
+	// NTLM AUTHENTICATE_MESSAGE.
+	ChallengeResponse(challenge []byte) ([]byte, error)
 }
+
+// NTLMChannelBinder is an optional NTLMNegotiator capability. When the resolved
+// negotiator implements it and channel binding is enabled on a TLS connection,
+// ldap supplies the RFC 5929 channel-binding hash before ChallengeResponse.
+type NTLMChannelBinder interface {
+	SetChannelBindingHash(hash [16]byte)
+}
+
+// NTLMSessionProvider is an optional NTLMNegotiator capability. When the
+// resolved negotiator implements it, ldap can install a SASL sign/seal security
+// layer on the connection after a successful bind using the returned session.
+type NTLMSessionProvider interface {
+	// SecuritySession returns the negotiated NTLM SASL session, or nil if no
+	// integrity/confidentiality was negotiated.
+	SecuritySession() SASLSession
+}
+
+// NTLMCredentials carries the inputs that NTLMNegotiatorFactory needs to build a
+// negotiator for a credential-based bind.
+type NTLMCredentials struct {
+	Domain      string
+	Workstation string
+	Username    string
+	// Password is used when Hash is empty.
+	Password string
+	// Hash is the NT hash for pass-the-hash; when set, Password is ignored.
+	Hash []byte
+	// SignSeal indicates the caller intends to negotiate a SASL sign/seal
+	// security layer, so the negotiator must retain integrity/confidentiality
+	// flags and the MIC.
+	SignSeal bool
+}
+
+// NTLMNegotiatorFactory, when set, builds a stateful NTLM negotiator from
+// credentials. It enables the credential-based NTLM bind and signing-detection
+// helpers without ldap importing a concrete NTLM implementation.
+// Standalone callers may register their own or pass
+// NTLMBindRequest.Negotiator explicitly. nil by default.
+var NTLMNegotiatorFactory func(NTLMCredentials) (NTLMNegotiator, error)
 
 func (req *NTLMBindRequest) appendTo(envelope *ber.Packet) (err error) {
 	request := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ApplicationBindRequest, nil, "Bind Request")
 	request.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, 3, "Version"))
 	request.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "User Name"))
 
-	var negMessage []byte
-
-	// generate an NTLMSSP Negotiation message for the specified domain (it can be blank)
-	switch {
-	case req.Negotiator == nil:
-		req.ntlmClient = &ntlmssp.Client{
-			Domain:      req.Domain,
-			Workstation: "",
-		}
-		// Configure the NTLM client flags to match the requested SASL
-		// security level. StripFlags and DisableMIC are applied inside
-		// go-smb before any internal state is stored, so the flag
-		// intersection, MIC, and session keys all remain consistent.
-		//
-		// Note: AD always seals LDAP SASL responses when NTLM integrity
-		// is negotiated, so SASLSecuritySign uses the same NTLM flags as
-		// SASLSecuritySeal. The SASL layer handles both modes via
-		// Seal/Unseal.
-		if req.SASLSecurity == SASLSecurityNone {
-			req.ntlmClient.StripFlags = ntlmssp.FlgNegSign | ntlmssp.FlgNegSeal
-			req.ntlmClient.DisableMIC = true
-		}
-		negMessage, err = req.ntlmClient.Negotiate()
-		if err != nil {
-			return fmt.Errorf("create NTLM negotiate message: %s", err)
-		}
-	default:
-		negMessage, err = req.Negotiator.Negotiate(req.Domain, "")
-		if err != nil {
-			return fmt.Errorf("create NTLM negotiate message with custom negotiator: %s", err)
-		}
+	// The negotiator is resolved by NTLMChallengeBind before the request is
+	// serialised, so that the same stateful instance handles both the negotiate
+	// and authenticate phases.
+	if req.neg == nil {
+		return errors.New("ldap: NTLM negotiator not resolved")
+	}
+	negMessage, err := req.neg.Negotiate(req.Domain, "")
+	if err != nil {
+		return fmt.Errorf("create NTLM negotiate message: %s", err)
 	}
 
 	// append the generated NTLMSSP message as a TagEnumerated BER value
@@ -553,18 +577,22 @@ func (l *Conn) NTLMBindWithHash(domain, username, hash string) error {
 
 // NTLMChallengeBind performs the NTLMSSP bind operation defined in the given request
 func (l *Conn) NTLMChallengeBind(ntlmBindRequest *NTLMBindRequest) (*NTLMBindResult, error) {
-	if !ntlmBindRequest.AllowEmptyPassword && ntlmBindRequest.Password == "" && ntlmBindRequest.Hash == "" {
-		return nil, NewError(ErrorEmptyPassword, errors.New("ldap: empty password not allowed by the client"))
-	}
+	// SASL sign/seal is incompatible with TLS (AD rejects it).
+	wantSASL := ntlmBindRequest.SASLSecurity != SASLSecurityNone && !l.isTLS
 
-	// Determine whether we need SASL wrapping. SASL sign/seal is
-	// incompatible with TLS (AD rejects it) and only works with the
-	// go-smb ntlmssp client (not custom Negotiators).
-	saslMode := ntlmBindRequest.SASLSecurity
-	if l.isTLS || ntlmBindRequest.Negotiator != nil {
-		saslMode = SASLSecurityNone
+	// Resolve the NTLM implementation: an explicitly supplied negotiator, or one
+	// built from the request credentials via the registered factory. The same
+	// stateful instance is reused for the negotiate and authenticate phases.
+	neg, err := resolveNTLMNegotiator(ntlmBindRequest, wantSASL)
+	if err != nil {
+		return nil, err
 	}
-	useSASL := saslMode != SASLSecurityNone
+	ntlmBindRequest.neg = neg
+
+	// SASL wrapping is installed only when the negotiator can expose a sign/seal
+	// session.
+	sessionProvider, canSession := neg.(NTLMSessionProvider)
+	useSASL := wantSASL && canSession
 
 	// --- Phase 1: send NTLM Negotiate, receive Challenge ---
 	msgCtx, err := l.doRequest(ntlmBindRequest)
@@ -612,46 +640,18 @@ func (l *Conn) NTLMChallengeBind(ntlmBindRequest *NTLMBindRequest) (*NTLMBindRes
 	}
 
 	// --- Phase 2: generate NTLM Authenticate response ---
-	var responseMessage []byte
-
-	switch {
-	case ntlmBindRequest.Hash == "" && ntlmBindRequest.Password == "" && !ntlmBindRequest.AllowEmptyPassword:
-		err = fmt.Errorf("need a password or hash to generate reply")
-	case ntlmBindRequest.Negotiator == nil:
-		// Extract domain from username if present (DOMAIN\user format)
-		username := ntlmBindRequest.Username
-		domain := ntlmBindRequest.Domain
-		if parts := strings.SplitN(username, `\`, 2); len(parts) == 2 {
-			domain = parts[0]
-			username = parts[1]
-		}
-		ntlmBindRequest.ntlmClient.User = username
-		ntlmBindRequest.ntlmClient.Domain = domain
-		if ntlmBindRequest.Hash != "" {
-			hashBytes, decErr := hex.DecodeString(ntlmBindRequest.Hash)
-			if decErr != nil {
-				return result, fmt.Errorf("failed to decode NTLM hash: %s", decErr)
-			}
-			ntlmBindRequest.ntlmClient.Hash = hashBytes
-		} else {
-			ntlmBindRequest.ntlmClient.Password = ntlmBindRequest.Password
-		}
-		if ntlmBindRequest.ChannelBinding {
+	// Channel binding (EPA) is only available when the negotiator supports it.
+	if ntlmBindRequest.ChannelBinding {
+		if cb, ok := neg.(NTLMChannelBinder); ok {
 			cbHash, cbErr := l.computeNTLMChannelBinding()
 			if cbErr != nil {
 				return result, cbErr
 			}
-			ntlmBindRequest.ntlmClient.SetChannelBindingHash(cbHash)
+			cb.SetChannelBindingHash(cbHash)
 		}
-		responseMessage, err = ntlmBindRequest.ntlmClient.Authenticate(ntlmsspChallenge)
-	default:
-		hash := ntlmBindRequest.Hash
-		if len(hash) == 0 {
-			hash = ntHash(ntlmBindRequest.Password)
-		}
-		responseMessage, err = ntlmBindRequest.Negotiator.ChallengeResponse(ntlmsspChallenge, ntlmBindRequest.Username, hash)
 	}
 
+	responseMessage, err := neg.ChallengeResponse(ntlmsspChallenge)
 	if err != nil {
 		return result, fmt.Errorf("process NTLM challenge: %s", err)
 	}
@@ -698,7 +698,7 @@ func (l *Conn) NTLMChallengeBind(ntlmBindRequest *NTLMBindRequest) (*NTLMBindRes
 
 	// --- Phase 4: install SASL wrapping if requested ---
 	if useSASL {
-		session := ntlmBindRequest.ntlmClient.Session()
+		session := sessionProvider.SecuritySession()
 		if session == nil {
 			return result, fmt.Errorf("ldap: NTLM session not available for SASL wrapping")
 		}
@@ -737,16 +737,43 @@ func (l *Conn) computeNTLMChannelBinding() ([16]byte, error) {
 	return gssapi.ComputeChannelBindingHash(certHash), nil
 }
 
-func ntHash(pass string) string {
-	runes := utf16.Encode([]rune(pass))
+// resolveNTLMNegotiator returns the negotiator that will serve req: the one set
+// explicitly on the request, or otherwise one built from the request
+// credentials via the registered NTLMNegotiatorFactory. signSeal indicates the
+// caller intends to negotiate a SASL sign/seal security layer.
+func resolveNTLMNegotiator(req *NTLMBindRequest, signSeal bool) (NTLMNegotiator, error) {
+	if req.Negotiator != nil {
+		return req.Negotiator, nil
+	}
+	if !req.AllowEmptyPassword && req.Password == "" && req.Hash == "" {
+		return nil, NewError(ErrorEmptyPassword, errors.New("ldap: empty password not allowed by the client"))
+	}
+	if NTLMNegotiatorFactory == nil {
+		return nil, errors.New("ldap: no NTLM implementation available; set ldap.NTLMNegotiatorFactory or NTLMBindRequest.Negotiator")
+	}
 
-	b := bytes.Buffer{}
-	_ = binary.Write(&b, binary.LittleEndian, &runes)
+	// Extract domain from username if present (DOMAIN\user format).
+	domain, username := req.Domain, req.Username
+	if parts := strings.SplitN(username, `\`, 2); len(parts) == 2 {
+		domain, username = parts[0], parts[1]
+	}
 
-	hash := md4.New()
-	_, _ = hash.Write(b.Bytes())
+	var hash []byte
+	if req.Hash != "" {
+		h, err := hex.DecodeString(req.Hash)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode NTLM hash: %s", err)
+		}
+		hash = h
+	}
 
-	return hex.EncodeToString(hash.Sum(nil))
+	return NTLMNegotiatorFactory(NTLMCredentials{
+		Domain:   domain,
+		Username: username,
+		Password: req.Password,
+		Hash:     hash,
+		SignSeal: signSeal,
+	})
 }
 
 // GSSAPIClient interface is used as the client-side implementation for the

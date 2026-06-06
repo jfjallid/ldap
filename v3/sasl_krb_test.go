@@ -10,11 +10,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jfjallid/gokrb5/v8/crypto"
-	krbgssapi "github.com/jfjallid/gokrb5/v8/gssapi"
-	"github.com/jfjallid/gokrb5/v8/iana/etypeID"
-	"github.com/jfjallid/gokrb5/v8/iana/keyusage"
-	"github.com/jfjallid/gokrb5/v8/types"
+	"github.com/jfjallid/gokrb5/v9/crypto"
+	krbgssapi "github.com/jfjallid/gokrb5/v9/gssapi"
+	"github.com/jfjallid/gokrb5/v9/iana/etypeID"
+	"github.com/jfjallid/gokrb5/v9/iana/keyusage"
+	"github.com/jfjallid/gokrb5/v9/types"
 )
 
 func newTestSubkey(t *testing.T) (keyType int32, keyValue []byte) {

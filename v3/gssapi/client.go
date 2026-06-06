@@ -9,18 +9,17 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/jfjallid/go-smb/gss"
-	"github.com/jfjallid/go-smb/krb5ssp"
-
-	"github.com/jfjallid/gokrb5/v8/client"
-	"github.com/jfjallid/gokrb5/v8/config"
-	"github.com/jfjallid/gokrb5/v8/credentials"
-	"github.com/jfjallid/gokrb5/v8/crypto"
-	"github.com/jfjallid/gokrb5/v8/gssapi"
-	"github.com/jfjallid/gokrb5/v8/iana/keyusage"
-	"github.com/jfjallid/gokrb5/v8/keytab"
-	"github.com/jfjallid/gokrb5/v8/messages"
-	"github.com/jfjallid/gokrb5/v8/types"
+	"github.com/jfjallid/gokrb5/v9/client"
+	"github.com/jfjallid/gokrb5/v9/config"
+	"github.com/jfjallid/gokrb5/v9/credentials"
+	"github.com/jfjallid/gokrb5/v9/crypto"
+	"github.com/jfjallid/gokrb5/v9/gssapi"
+	"github.com/jfjallid/gokrb5/v9/iana/chksumtype"
+	"github.com/jfjallid/gokrb5/v9/iana/flags"
+	"github.com/jfjallid/gokrb5/v9/iana/keyusage"
+	"github.com/jfjallid/gokrb5/v9/keytab"
+	"github.com/jfjallid/gokrb5/v9/messages"
+	"github.com/jfjallid/gokrb5/v9/types"
 )
 
 var le = binary.LittleEndian
@@ -241,7 +240,7 @@ func (client *Client) InitSecContextWithOptions(target string, input []byte, APO
 			cbPtr = &client.channelBindingHash
 		}
 		authenticator.Cksum = types.Checksum{
-			CksumType: krb5ssp.IanaKrb5ChecksumGSSAPI,
+			CksumType: chksumtype.GSSAPI,
 			Checksum:  newAuthenticatorChecksum(gssapiFlags, cbPtr),
 		}
 
@@ -266,15 +265,15 @@ func (client *Client) InitSecContextWithOptions(target string, input []byte, APO
 		for _, opt := range APOptions {
 			types.SetFlag(&apReq.APOptions, opt)
 		}
-		types.SetFlag(&apReq.APOptions, krb5ssp.APOptionMutualRequired)
+		types.SetFlag(&apReq.APOptions, flags.APOptionMutualRequired)
 
-		token := krb5ssp.KRB5Token{
-			Oid:     gss.KerberosSSPMechTypeOid,
-			TokenId: krb5ssp.TokenIdKrb5APReq,
+		token := krb5Token{
+			Oid:     gssapi.OIDKRB5.OID(),
+			TokenId: tokenIdKrb5APReq,
 			APReq:   apReq,
 		}
 
-		output, err := token.MarshalBinary()
+		output, err := token.Marshal()
 		if err != nil {
 			return nil, false, err
 		}
@@ -282,16 +281,16 @@ func (client *Client) InitSecContextWithOptions(target string, input []byte, APO
 		return output, true, nil
 
 	default:
-		var token krb5ssp.KRB5Token
+		var token krb5Token
 
-		err := token.UnmarshalBinary(input)
+		err := token.Unmarshal(input)
 		if err != nil {
 			return nil, false, err
 		}
 
 		var completed bool
 
-		if token.TokenId == krb5ssp.TokenIdKrb5APRep {
+		if token.TokenId == tokenIdKrb5APRep {
 			completed = true
 
 			encpart, err := crypto.DecryptEncPart(token.APRep.EncPart, client.ekey, keyusage.AP_REP_ENCPART)
@@ -307,7 +306,7 @@ func (client *Client) InitSecContextWithOptions(target string, input []byte, APO
 			client.Subkey = part.Subkey
 		}
 
-		if token.TokenId == krb5ssp.TokenIdKrb5Error {
+		if token.TokenId == tokenIdKrb5Error {
 			return nil, true, token.KRBError
 		}
 

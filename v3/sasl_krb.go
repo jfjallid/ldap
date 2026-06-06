@@ -8,10 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jfjallid/gokrb5/v8/crypto"
-	krbgssapi "github.com/jfjallid/gokrb5/v8/gssapi"
-	"github.com/jfjallid/gokrb5/v8/iana/keyusage"
-	"github.com/jfjallid/gokrb5/v8/types"
+	"github.com/jfjallid/gokrb5/v9/crypto"
+	krbgssapi "github.com/jfjallid/gokrb5/v9/gssapi"
+	"github.com/jfjallid/gokrb5/v9/iana/keyusage"
+	"github.com/jfjallid/gokrb5/v9/types"
 )
 
 // krbSASLConn wraps a net.Conn with Kerberos GSSAPI SASL framing.

@@ -7,9 +7,20 @@ import (
 	"net"
 	"sync"
 	"time"
-
-	"github.com/jfjallid/go-smb/ntlmssp"
 )
+
+// SASLSession wraps and unwraps SASL-protected LDAP messages for an NTLM
+// sign/seal security layer. It is implemented by the NTLM negotiator supplied to
+// the bind (see NTLMSessionProvider) so that ldap depends only on this interface
+// and not on any concrete NTLM implementation.
+type SASLSession interface {
+	// Seal protects plaintext for sending, returning the wrapped bytes
+	// ([16-byte MAC][ciphertext]) and the next sequence number.
+	Seal(dst, plaintext []byte, seqNum uint32) ([]byte, uint32)
+	// Unseal validates and decrypts a wrapped message, returning the plaintext
+	// and the next sequence number.
+	Unseal(dst, ciphertext []byte, seqNum uint32) ([]byte, uint32, error)
+}
 
 // SASLSecurityMode controls SASL security layer after NTLM bind.
 // Values match RFC 4752 security layer bitmask and can be used directly
@@ -70,7 +81,7 @@ func (b *saslReadBuffer) store(data []byte) {
 // both SASLSecuritySign and SASLSecuritySeal.
 type saslConn struct {
 	conn    net.Conn
-	session *ntlmssp.Session
+	session SASLSession
 
 	// write side
 	wSeqNum uint32
@@ -84,7 +95,7 @@ type saslConn struct {
 
 var _ net.Conn = (*saslConn)(nil)
 
-func newSASLConn(conn net.Conn, session *ntlmssp.Session) *saslConn {
+func newSASLConn(conn net.Conn, session SASLSession) *saslConn {
 	return &saslConn{
 		conn:    conn,
 		session: session,
