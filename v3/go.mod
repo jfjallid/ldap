@@ -9,7 +9,7 @@ require (
 	github.com/go-asn1-ber/asn1-ber v1.5.8-0.20250403174932-29230038a667
 	github.com/google/uuid v1.6.0
 	github.com/jfjallid/gofork v1.7.6
-	github.com/jfjallid/gokrb5/v9 v9.0.0
+	github.com/jfjallid/gokrb5/v9 v9.1.0
 	github.com/jfjallid/testify v0.0.0-20240505093606-b0b4c2a12e2c
 )
 
