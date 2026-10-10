@@ -26,6 +26,8 @@ const (
 	MessageFinish = 3
 	// MessageTimeout indicates the client-specified timeout for a particular message ID has been reached
 	MessageTimeout = 4
+	// MessageCancel indicates a particular message ID was abandoned by the client
+	MessageCancel = 5
 )
 
 const (
@@ -106,6 +108,7 @@ type Conn struct {
 	Debug               debugging
 	chanConfirm         chan struct{}
 	messageContexts     map[int64]*messageContext
+	inFlight            map[int64]struct{} // guarded by messageMutex; see AbandonAll
 	chanMessage         chan *messagePacket
 	chanMessageID       chan int64
 	wgClose             sync.WaitGroup
@@ -258,6 +261,7 @@ func NewConn(conn net.Conn, isTLS bool) *Conn {
 		chanMessageID:   make(chan int64),
 		chanMessage:     make(chan *messagePacket, 10),
 		messageContexts: map[int64]*messageContext{},
+		inFlight:        map[int64]struct{}{},
 		requestTimeout:  0,
 		isTLS:           isTLS,
 	}
@@ -438,6 +442,11 @@ func (l *Conn) sendMessageWithFlags(packet *ber.Packet, flags sendMessageFlags) 
 
 	responses := make(chan *PacketResponse)
 	messageID := packet.Children[0].Value.(int64)
+
+	l.messageMutex.Lock()
+	l.inFlight[messageID] = struct{}{}
+	l.messageMutex.Unlock()
+
 	message := &messagePacket{
 		Op:        MessageRequest,
 		MessageID: messageID,
@@ -466,6 +475,7 @@ func (l *Conn) finishMessage(msgCtx *messageContext) {
 
 	l.messageMutex.Lock()
 	l.outstandingRequests--
+	delete(l.inFlight, msgCtx.id)
 	if l.isStartingTLS {
 		l.isStartingTLS = false
 	}
@@ -572,6 +582,27 @@ func (l *Conn) processMessages() {
 				if msgCtx, ok := l.messageContexts[message.MessageID]; ok {
 					l.Debug.Printf("Receiving message timeout for %d", message.MessageID)
 					msgCtx.sendResponse(&PacketResponse{message.Packet, NewError(ErrorNetwork, errors.New("ldap: connection timed out"))}, time.Duration(l.getTimeout()))
+					delete(l.messageContexts, message.MessageID)
+					close(msgCtx.responses)
+				}
+			case MessageCancel:
+				// Tell the server to stop working on the request, then unblock
+				// the waiting caller with ErrAbandoned. An AbandonRequest
+				// draws no response, so once the write is away nothing further
+				// will arrive for this message ID and the context can go.
+				// Writing here keeps processMessages the connection's single
+				// writer.
+				if msgCtx, ok := l.messageContexts[message.MessageID]; ok {
+					l.Debug.Printf("Abandoning message %d", message.MessageID)
+					if message.Packet != nil {
+						if _, err := l.conn.Write(message.Packet.Bytes()); err != nil {
+							// The caller is unblocked regardless: a connection
+							// too broken to carry the abandon is not a reason
+							// to leave it waiting forever.
+							l.Debug.Printf("Error sending abandon request: %s", err.Error())
+						}
+					}
+					msgCtx.sendResponse(&PacketResponse{Error: ErrAbandoned}, time.Duration(l.getTimeout()))
 					delete(l.messageContexts, message.MessageID)
 					close(msgCtx.responses)
 				}

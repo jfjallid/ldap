@@ -22,6 +22,13 @@ type SASLSession interface {
 	Unseal(dst, ciphertext []byte, seqNum uint32) ([]byte, uint32, error)
 }
 
+// saslErrSealer is an optional SASLSession capability: SealErr is Seal that
+// reports a wrapping failure, which saslConn then returns from Write instead of
+// sending an empty frame.
+type saslErrSealer interface {
+	SealErr(dst, plaintext []byte, seqNum uint32) ([]byte, uint32, error)
+}
+
 // SASLSecurityMode controls SASL security layer after NTLM bind.
 // Values match RFC 4752 security layer bitmask and can be used directly
 // as the SASL security layer byte on the wire.
@@ -111,7 +118,16 @@ func (s *saslConn) Write(p []byte) (int, error) {
 	// AD always seals LDAP SASL traffic when NTLM integrity is
 	// negotiated, so both Sign and Seal use Seal/Unseal framing:
 	// [16-byte MAC][ciphertext].
-	sealed, newSeq := s.session.Seal(nil, p, s.wSeqNum)
+	var sealed []byte
+	var newSeq uint32
+	if se, ok := s.session.(saslErrSealer); ok {
+		var err error
+		if sealed, newSeq, err = se.SealErr(nil, p, s.wSeqNum); err != nil {
+			return 0, fmt.Errorf("ldap: SASL wrap failed: %w", err)
+		}
+	} else {
+		sealed, newSeq = s.session.Seal(nil, p, s.wSeqNum)
+	}
 	s.wSeqNum = newSeq
 
 	// Build frame: [4-byte BE length][wrapped data]
@@ -167,8 +183,26 @@ func (s *saslConn) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// Close closes the underlying connection and then, when the session holds
+// resources of its own (an OS security context, for example), releases them.
+func (s *saslConn) Close() error {
+	err := s.conn.Close()
+	if c, ok := s.session.(io.Closer); ok {
+		// Closing the connection first unblocks a pending Read, so both
+		// locks become free; holding them keeps a concurrent Seal or Unseal
+		// from using the session after it is released.
+		s.wMu.Lock()
+		defer s.wMu.Unlock()
+		s.rMu.Lock()
+		defer s.rMu.Unlock()
+		if cerr := c.Close(); err == nil {
+			err = cerr
+		}
+	}
+	return err
+}
+
 // Delegate remaining net.Conn methods to the underlying connection.
-func (s *saslConn) Close() error                       { return s.conn.Close() }
 func (s *saslConn) LocalAddr() net.Addr                { return s.conn.LocalAddr() }
 func (s *saslConn) RemoteAddr() net.Addr               { return s.conn.RemoteAddr() }
 func (s *saslConn) SetDeadline(t time.Time) error      { return s.conn.SetDeadline(t) }

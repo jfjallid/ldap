@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"github.com/alexbrainman/sspi"
 	"github.com/alexbrainman/sspi/kerberos"
@@ -19,6 +20,25 @@ type SSPIClient struct {
 	creds           *sspi.Credentials
 	ctx             *kerberos.ClientContext
 	channelBindings []byte
+	// saslSecurity is the RFC 4752 security layer to select in
+	// NegotiateSaslAuth (0 none, 2 integrity, 4 confidentiality), set by
+	// ldap through SetSASLSecurity.
+	saslSecurity int
+}
+
+// kerbWrapNoEncrypt is KERB_WRAP_NO_ENCRYPT (SECQOP_WRAP_NO_ENCRYPT): passed to
+// EncryptMessage it makes Wrap sign without encrypting, and DecryptMessage
+// reports it for a message that was only signed.
+const kerbWrapNoEncrypt = 0x80000001
+
+// saslMaxReceive is the maximum wrapped message size advertised to the server
+// when a security layer is selected, matching the gokrb5 client.
+const saslMaxReceive = 0xFFFF
+
+// SetSASLSecurity sets the security layer NegotiateSaslAuth selects. ldap calls
+// it before the bind with the requested SASLSecurityMode.
+func (c *SSPIClient) SetSASLSecurity(mode int) {
+	c.saslSecurity = mode
 }
 
 // NewSSPIClient returns a client with credentials of the current user.
@@ -75,6 +95,7 @@ func NewSSPIClientWithChannelBinding(cert *x509.Certificate) (*SSPIClient, error
 func (c *SSPIClient) Close() error {
 	err1 := c.DeleteSecContext()
 	err2 := c.creds.Release()
+	c.creds = nil
 	if err1 != nil {
 		return err1
 	}
@@ -84,9 +105,12 @@ func (c *SSPIClient) Close() error {
 	return nil
 }
 
-// DeleteSecContext destroys any established secure context.
+// DeleteSecContext destroys any established secure context, unless
+// SASLWrapSession has handed it to a wrapping session.
 func (c *SSPIClient) DeleteSecContext() error {
-	return c.ctx.Release()
+	err := c.ctx.Release()
+	c.ctx = nil
+	return err
 }
 
 // InitSecContext initiates the establishment of a security context for
@@ -175,13 +199,13 @@ func (c *SSPIClient) NegotiateSaslAuth(token []byte, authzid string) ([]byte, er
 	// supportNoSecurity := input[0] & 0b00000001
 	// supportIntegrity := input[0] & 0b00000010
 	// supportPrivacy := input[0] & 0b00000100
-	selectedSec := 0 // Disabled
+	selectedSec := c.saslSecurity
 	var maxSecMsgSize uint32
 	if selectedSec != 0 {
-		maxSecMsgSize, _, _, _, err = c.ctx.Sizes()
-		if err != nil {
-			return nil, fmt.Errorf("error getting security context max message size: %w", err)
+		if inputPayload[0]&byte(selectedSec) == 0 {
+			return nil, fmt.Errorf("server does not offer SASL security layer %d (offered %#x)", selectedSec, inputPayload[0])
 		}
+		maxSecMsgSize = saslMaxReceive
 	}
 
 	// https://learn.microsoft.com/en-us/windows/win32/api/sspi/nf-sspi-encryptmessage
@@ -245,4 +269,84 @@ func createChannelBindingsStructure(applicationData []byte) []byte {
 	copy(buf[headerSize:], applicationData)
 
 	return buf
+}
+
+// SASLWrapSession returns the RFC 4752 security layer selected in
+// NegotiateSaslAuth, or nil when none was. ldap wraps every message after the
+// bind through it. The session takes over the context and credential handles,
+// because ldap deletes the client's context when the bind returns; the session
+// releases them when ldap closes the connection.
+func (c *SSPIClient) SASLWrapSession() SASLWrapper {
+	if c.saslSecurity == 0 || c.ctx == nil {
+		return nil
+	}
+	session := &sspiWrapSession{ctx: c.ctx, creds: c.creds, seal: c.saslSecurity == 4}
+	c.ctx, c.creds = nil, nil
+	return session
+}
+
+// sspiWrapSession wraps LDAP messages with SSPI's EncryptMessage and
+// DecryptMessage over the established Kerberos context. The wrapped bytes are
+// the GSS-API Wrap token (the token, data and padding buffers concatenated, see
+// https://learn.microsoft.com/en-us/windows/win32/secauthn/sspi-kerberos-interoperability-with-gssapi).
+// SSPI keeps the per-direction sequence numbers, so ldap's seqNum is only
+// returned incremented.
+type sspiWrapSession struct {
+	mu    sync.Mutex // SSPI per-message calls on one context are not documented as thread-safe
+	ctx   *kerberos.ClientContext
+	creds *sspi.Credentials
+	seal  bool // confidentiality; otherwise integrity only
+}
+
+func (s *sspiWrapSession) Seal(dst, plaintext []byte, seqNum uint32) ([]byte, uint32) {
+	out, next, _ := s.SealErr(dst, plaintext, seqNum)
+	return out, next
+}
+
+func (s *sspiWrapSession) SealErr(dst, plaintext []byte, seqNum uint32) ([]byte, uint32, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ctx == nil {
+		return dst, seqNum + 1, fmt.Errorf("sspi: wrap after the session was closed")
+	}
+	var qop uint32
+	if !s.seal {
+		qop = kerbWrapNoEncrypt
+	}
+	// EncryptMessage works in place, so give it a copy.
+	msg := append([]byte(nil), plaintext...)
+	wrapped, err := s.ctx.EncryptMessage(msg, qop, 0)
+	if err != nil {
+		return dst, seqNum + 1, fmt.Errorf("sspi: EncryptMessage: %w", err)
+	}
+	return append(dst, wrapped...), seqNum + 1, nil
+}
+
+func (s *sspiWrapSession) Unseal(dst, wrapped []byte, seqNum uint32) ([]byte, uint32, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ctx == nil {
+		return nil, 0, fmt.Errorf("sspi: unwrap after the session was closed")
+	}
+	qop, data, err := s.ctx.DecryptMessage(append([]byte(nil), wrapped...), 0)
+	if err != nil {
+		return nil, 0, fmt.Errorf("sspi: DecryptMessage: %w", err)
+	}
+	if s.seal && qop&kerbWrapNoEncrypt != 0 {
+		return nil, 0, fmt.Errorf("sspi: server sent an unencrypted message on a sealed connection")
+	}
+	return append(dst, data...), seqNum + 1, nil
+}
+
+// Close releases the context and credential handles taken from the client.
+func (s *sspiWrapSession) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err := s.ctx.Release()
+	s.ctx = nil
+	if cerr := s.creds.Release(); err == nil {
+		err = cerr
+	}
+	s.creds = nil
+	return err
 }

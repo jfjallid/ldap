@@ -932,6 +932,20 @@ func (l *Conn) GSSAPIBindRequestWithAPOptions(client GSSAPIClient, req *GSSAPIBi
 
 	// Install Kerberos SASL wrapping if requested.
 	if useSASL {
+		// A client that wraps messages itself (Windows SSPI, which does not
+		// export the session key) supplies a session for the generic framing.
+		type saslWrapSessionProvider interface {
+			SASLWrapSession() gssapi.SASLWrapper
+		}
+		if wp, ok := client.(saslWrapSessionProvider); ok {
+			session := wp.SASLWrapSession()
+			if session == nil {
+				return fmt.Errorf("ldap: GSSAPI client did not establish a SASL security layer")
+			}
+			l.conn = newSASLConn(l.conn, session)
+			go l.reader()
+			return nil
+		}
 		// Use type assertion to get the session subkey from the GSSAPI client.
 		// The saslKeyProvider interface is intentionally local to avoid
 		// coupling the core ldap package to gokrb5 types.

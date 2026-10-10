@@ -501,6 +501,13 @@ func NewSearchRequest(
 //
 // A requested pagingSize of 0 is interpreted as no limit by LDAP servers.
 func (l *Conn) SearchWithPaging(searchRequest *SearchRequest, pagingSize uint32) (*SearchResult, error) {
+	return l.SearchWithPagingWithContext(context.Background(), searchRequest, pagingSize)
+}
+
+// SearchWithPagingWithContext is SearchWithPaging with cancellation. Cancelling
+// ctx abandons the page currently in flight and returns the pages gathered so
+// far along with an error satisfying errors.Is(err, ErrAbandoned).
+func (l *Conn) SearchWithPagingWithContext(ctx context.Context, searchRequest *SearchRequest, pagingSize uint32) (*SearchResult, error) {
 	var pagingControl *ControlPaging
 
 	control := FindControl(searchRequest.Controls, ControlTypePaging)
@@ -520,7 +527,7 @@ func (l *Conn) SearchWithPaging(searchRequest *SearchRequest, pagingSize uint32)
 
 	searchResult := new(SearchResult)
 	for {
-		result, err := l.Search(searchRequest)
+		result, err := l.SearchWithContext(ctx, searchRequest)
 		if result != nil {
 			result.appendTo(searchResult)
 		} else {
@@ -553,6 +560,8 @@ func (l *Conn) SearchWithPaging(searchRequest *SearchRequest, pagingSize uint32)
 	}
 
 	if pagingControl != nil {
+		// Deliberately not ctx: this release of the server-side paged result
+		// set is exactly what still has to happen when ctx was cancelled.
 		l.Debug.Printf("Abandoning Paging...")
 		pagingControl.PagingSize = 0
 		if _, err := l.Search(searchRequest); err != nil {
@@ -563,13 +572,27 @@ func (l *Conn) SearchWithPaging(searchRequest *SearchRequest, pagingSize uint32)
 	return searchResult, nil
 }
 
-// Search performs the given search request
+// Search performs the given search request.
+//
+// The request cannot be cancelled; use SearchWithContext when the caller needs
+// to be able to abandon a long-running search.
 func (l *Conn) Search(searchRequest *SearchRequest) (*SearchResult, error) {
+	return l.SearchWithContext(context.Background(), searchRequest)
+}
+
+// SearchWithContext performs the given search request, abandoning it if ctx is
+// cancelled before the server finishes responding.
+//
+// On cancellation the search returns the entries received so far together with
+// an error satisfying errors.Is(err, ErrAbandoned), and the connection remains
+// usable for further requests.
+func (l *Conn) SearchWithContext(ctx context.Context, searchRequest *SearchRequest) (*SearchResult, error) {
 	msgCtx, err := l.doRequest(searchRequest)
 	if err != nil {
 		return nil, err
 	}
 	defer l.finishMessage(msgCtx)
+	l.watchContext(ctx, msgCtx)
 
 	result := &SearchResult{
 		Entries:   make([]*Entry, 0),

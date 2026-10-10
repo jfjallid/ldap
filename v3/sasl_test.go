@@ -135,3 +135,70 @@ func TestSASLConnReadBodyTruncated(t *testing.T) {
 		t.Fatalf("expected io.ErrUnexpectedEOF, got %v", err)
 	}
 }
+
+// fakeWrapSession is a SASLSession that also implements SealErr and Close, the
+// optional capabilities saslConn uses for sessions that own OS resources.
+type fakeWrapSession struct {
+	sealErr error
+	closed  int
+}
+
+func (f *fakeWrapSession) Seal(dst, p []byte, seq uint32) ([]byte, uint32) {
+	out, next, _ := f.SealErr(dst, p, seq)
+	return out, next
+}
+
+func (f *fakeWrapSession) SealErr(dst, p []byte, seq uint32) ([]byte, uint32, error) {
+	if f.sealErr != nil {
+		return dst, seq + 1, f.sealErr
+	}
+	return append(dst, p...), seq + 1, nil
+}
+
+func (f *fakeWrapSession) Unseal(dst, w []byte, seq uint32) ([]byte, uint32, error) {
+	return append(dst, w...), seq + 1, nil
+}
+
+func (f *fakeWrapSession) Close() error { f.closed++; return nil }
+
+type recordingConn struct {
+	fakeReadConn
+	written bytes.Buffer
+}
+
+func (r *recordingConn) Write(p []byte) (int, error) { return r.written.Write(p) }
+
+func TestSASLConnWriteReportsSealErr(t *testing.T) {
+	conn := &recordingConn{fakeReadConn: fakeReadConn{r: bytes.NewReader(nil)}}
+	s := newSASLConn(conn, &fakeWrapSession{sealErr: errors.New("handle invalid")})
+	n, err := s.Write([]byte("message"))
+	if err == nil || !strings.Contains(err.Error(), "handle invalid") {
+		t.Fatalf("Write error = %v, want the SealErr failure", err)
+	}
+	if n != 0 || conn.written.Len() != 0 {
+		t.Fatalf("Write sent %d bytes (n=%d); a failed wrap must send nothing", conn.written.Len(), n)
+	}
+}
+
+func TestSASLConnWriteFramesSealErrOutput(t *testing.T) {
+	conn := &recordingConn{fakeReadConn: fakeReadConn{r: bytes.NewReader(nil)}}
+	s := newSASLConn(conn, &fakeWrapSession{})
+	if _, err := s.Write([]byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0, 0, 0, 3, 'a', 'b', 'c'}
+	if !bytes.Equal(conn.written.Bytes(), want) {
+		t.Fatalf("frame = %x, want %x", conn.written.Bytes(), want)
+	}
+}
+
+func TestSASLConnCloseClosesSession(t *testing.T) {
+	session := &fakeWrapSession{}
+	s := newSASLConn(&fakeReadConn{r: bytes.NewReader(nil)}, session)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if session.closed != 1 {
+		t.Fatalf("session closed %d times, want 1", session.closed)
+	}
+}
